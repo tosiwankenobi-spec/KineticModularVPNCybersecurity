@@ -1,0 +1,124 @@
+{
+  "theme": "dark",
+  "archetype": "The Performance Pro / Technical Brutalism",
+  "typography": {
+    "headings": {
+      "family": "Outfit",
+      "weights": ["300", "800"],
+      "classes": "font-sans tracking-tight",
+      "usage": "Use font-light for large marketing headers, font-black for numbers and metric highlights."
+    },
+    "body": {
+      "family": "IBM Plex Sans",
+      "weights": ["400", "500"],
+      "classes": "font-sans leading-relaxed tracking-normal",
+      "usage": "All standard text, paragraphs, and descriptions."
+    },
+    "monospace": {
+      "family": "JetBrains Mono",
+      "weights": ["400", "700"],
+      "classes": "font-mono text-sm tracking-[0.1em]",
+      "usage": "IP addresses, Security Scores, Threat Hashes, overlines, labels, and numeric metrics."
+    }
+  },
+  "colors": {
+    "background": {
+      "default": "#09090B",
+      "surface": "#121215",
+      "surface_hover": "#18181C"
+    },
+    "text": {
+      "primary": "#FFFFFF",
+      "secondary": "#A1A1AA",
+      "muted": "#71717A"
+    },
+    "border": {
+      "default": "#27272A",
+      "subtle": "rgba(255, 255, 255, 0.05)"
+    },
+    "brand": {
+      "accent": "#00E599",
+      "accent_glow": "rgba(0, 229, 153, 0.2)",
+      "threat": "#FF3366",
+      "threat_glow": "rgba(255, 51, 102, 0.2)",
+      "warning": "#FFB800"
+    }
+  },
+  "visual_enhancers": {
+    "glassmorphism": "Use bg-black/60 backdrop-blur-2xl border-b border-white/10. Crucial for headers and sticky elements. Do not use plain transparency.",
+    "technical_grid": "Apply a subtle background grid pattern using CSS radial-gradient or linear-gradient to ground the 'Command Center' feel.",
+    "borders": "Expose the skeleton. Use 1px solid borders (border-border). Avoid soft shadows entirely in dark mode; rely on crisp borders and inner glows.",
+    "tracing_beam": "Apply moving gradient borders (or animated SVG traces) to active Threat Alerts or the primary Premium Subscription card.",
+    "textures": "Include a subtle noise overlay (opacity-20 mix-blend-overlay) over marketing sections to avoid flat digital outputs."
+  },
+  "component_design": {
+    "buttons": "Sharp edges (rounded-sm). Primary action: bg-[#00E599] text-black font-semibold hover:bg-[#00c985] hover:-translate-y-0.5 transition-transform. Secondary: border border-[#27272A] bg-transparent text-white hover:bg-white hover:text-black.",
+    "cards": "Flat solid background (#121215), 1px border (#27272A). For active/alert states, change border to threat/accent color.",
+    "badges": "Square or very slightly rounded. Monospace font. bg-[#FF3366]/10 text-[#FF3366] for Malware; bg-[#00E599]/10 text-[#00E599] for Secure.",
+    "inputs": "Shadcn inputs customized: bg-transparent border-b-2 border-l-0 border-r-0 border-t-0 border-[#27272A] focus:border-[#00E599] focus:ring-0 rounded-none.",
+    "progress": "For malware scans, use thin progress bars (h-1) glowing with brand.accent."
+  },
+  "grids": {
+    "dashboard": "Mode B (High Density). Base grid-cols-1 md:grid-cols-4. Gap-4. Every widget fills height exactly. No empty spaces. Heavy use of border-collapse style layouts.",
+    "marketing": "Mode A (Tetris). grid-cols-1 md:grid-cols-12 gap-8. Create asymmetry. Span-8 for hero text, Span-4 for 3D visual or stats."
+  },
+  "layouts": {
+    "navigation": "Desktop: Slim side navigation (w-16 expanding to w-64 on hover) OR a top Crystal Glass nav. Dashboard must feel like a fullscreen app.",
+    "spacing": "Use p-6 or p-8 inside dashboard cards. Use massive spacing (py-24 or py-32) on marketing page sections."
+  },
+  "motion": {
+    "interactions": "Hover states must explicitly alter text color and background (e.g., hover:bg-white hover:text-black).",
+    "scrolling": "Implement Lenis smooth scrolling on the marketing landing page for a premium, weighty feel.",
+    "feedback": "Use Sonner for toasts (positioned bottom-right). Enter animations for dashboard widgets (staggered fade-up)."
+  },
+  "accessibility": {
+    "contrast": "Strict APCA compliance. Any text over brand.accent (Neon Green) MUST be black. Any text over threat (Red) MUST be white.",
+    "testing": "All interactive elements (buttons, toggles, scan triggers) MUST include data-testid attributes (e.g., data-testid='start-scan-btn')."
+  },
+  "media": {
+    "icons": "Use 'lucide-react' with a consistent stroke-width of 1.5. For critical alerts, animate the icon (pulse or shake).",
+    "illustrations": "Avoid generic tech illustrations. Use high-contrast macro photography or abstract dark geometric patterns."
+  },
+  "3d_libraries": {
+    "recommendation": "Use 'ts-particles' for a lightweight, interactive network mesh background on the landing page and VPN connection screen.",
+    "charts": "Use 'recharts' with a customized dark theme. Remove axis lines, keep grid lines faint (opacity-10). Use accent colors for data lines."
+  },
+  "image_urls": {
+    "hero_background": {
+      "url": "https://images.unsplash.com/photo-1770486036751-e55247238964?crop=entropy&cs=srgb&fm=jpg&ixid=M3w3NDQ2NDF8MHwxfHNlYXJjaHwzfHxhYnN0cmFjdCUyMGRhcmslMjBuZXR3b3JrJTIwbWVzaHxlbnwwfHx8fDE3ODgxODUzNjl8MA&ixlib=rb-4.1.0&q=85",
+      "description": "Abstract dark network mesh for marketing hero background. Apply a heavy dark overlay to ensure text contrast."
+    },
+    "feature_nodes": {
+      "url": "https://images.unsplash.com/photo-1639322537228-f710d846310a?crop=entropy&cs=srgb&fm=jpg&ixid=M3w3NDQ2NDF8MHwxfHNlYXJjaHwyfHxhYnN0cmFjdCUyMGRhcmslMjBuZXR3b3JrJTIwbWVzaHxlbnwwfHx8fDE3ODgxODUzNjl8MA&ixlib=rb-4.1.0&q=85",
+      "description": "Floating cubes on black surface. Perfect for demonstrating 'Quarantine' or 'Encrypted VPN Nodes' in the features section."
+    },
+    "server_infrastructure": {
+      "url": "https://images.unsplash.com/photo-1680992046617-e2e35451bcdb?crop=entropy&cs=srgb&fm=jpg&ixid=M3w4NjAxODF8MHwxfHNlYXJjaHwxfHxzZXJ2ZXIlMjByb29tJTIwZGFyayUyMGxpZ2h0aW5nfGVufDB8fHx8MTc4ODE4NTM3M3ww&ixlib=rb-4.1.0&q=85",
+      "description": "Macro shot of neon green server lights. Use in the VPN server selection or Device Health Monitoring section."
+    }
+  },
+  "instructions_to_main_agent": {
+    "1": "DO NOT use standard SaaS blue colors. Stick strictly to the Obsidian, Volt Green, and Signal Red palette defined.",
+    "2": "When building Shadcn components, strip away their default Vercel-like soft shadows and rounded corners. Enforce rounded-none or rounded-sm, and 1px borders.",
+    "3": "The App must feel like an elite security command center, not a generic B2B tool. Prioritize tension, asymmetry in marketing, and ultra-dense data display in the dashboard.",
+    "4": "Install @fontsource/outfit, @fontsource/ibm-plex-sans, and @fontsource/jetbrains-mono.",
+    "5": "Do NOT use transparent backgrounds on dropdowns or sticky headers; always apply a solid color or backdrop blur."
+  },
+  "UNIVERSAL GUIDELINES FOR MAIN AGENT": [
+    "You tend to converge toward generic, 'on distribution' outputs. In frontend design, this creates what users call the 'AI slop' aesthetic. Avoid this: make creative, distinctive frontends that surprise and delight.",
+    "Dark colors look good when used independently without gradients. DO NOT use dark colors as gradients.",
+    "Don't make generic centered layouts, simplistic gradients, and uniform styling.",
+    "Create depth through layered design elements with z-index hierarchy.",
+    "Use glass-morphism effects with backdrop filters (12-24px blur).",
+    "You MUST NOT apply universal transition. Eg: 'transition: all'. This results in breaking transforms. Always add transitions for specific interactive elements like button, input excluding transforms.",
+    "You MUST NOT center align the app container, ie do not add '.App { text-align: center; }' in the css file. This disrupts the human natural reading flow of text.",
+    "Always use modern button styles like pill-shaped, or sharp button with interaction animations & color relevant to the app style.",
+    "NEVER: use AI assistant Emoji characters like 🤖🧠💭💡🔮🎯 etc for icons.",
+    "Every interaction needs micro-animations - hover states, transitions, parallax effects, and entrance animations. Static = dead.",
+    "Use 2-3x more spacing than feels comfortable. Cramped designs look cheap.",
+    "Subtle grain textures, noise overlays, custom cursors, selection states, and loading animations: separates good from extraordinary.",
+    "Main agent relies on these image URLs. Missing categories (especially sponsor logos) = main agent will use placeholder text which is FORBIDDEN.",
+    "Prioritize using pre-existing components from src/components/ui when applicable.",
+    "Use sonner for toasts, located in /app/src/components/ui/sonner.js (Note: use .js/.jsx not .tsx as this is a JS project)."
+  ]
+}
