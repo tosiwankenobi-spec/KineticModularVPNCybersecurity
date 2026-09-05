@@ -9,3 +9,5 @@ pydantic[email]==2.10.4
 stripe==14.4.1
 python-multipart==0.0.20
 emergentintegrations
+anthropic==0.40.0
+cryptography==43.0.3

@@ -19,6 +19,9 @@ from pydantic import BaseModel, EmailStr, Field
 from motor.motor_asyncio import AsyncIOMotorClient
 from bson import ObjectId
 import stripe
+import anthropic
+
+from crypto_utils import encrypt_api_key, decrypt_api_key
 
 # ----------------------------------------------------------------------------
 # Config
@@ -81,6 +84,7 @@ def serialize_user(user: dict) -> dict:
         "role": user.get("role", "user"),
         "plan": user.get("plan", "free"),
         "created_at": user.get("created_at").isoformat() if isinstance(user.get("created_at"), datetime) else user.get("created_at"),
+        "has_custom_anthropic_key": bool(user.get("anthropic_api_key_encrypted")),
     }
 
 async def get_current_user(request: Request) -> dict:
@@ -444,6 +448,27 @@ SYSTEM_PROMPT = (
 class ChatMessage(BaseModel):
     message: str
 
+class AnthropicKeyRequest(BaseModel):
+    api_key: str = Field(min_length=20)
+
+@api.get("/settings/anthropic-key")
+async def get_anthropic_key_status(user: dict = Depends(get_current_user)):
+    return {"configured": bool(user.get("anthropic_api_key_encrypted"))}
+
+@api.post("/settings/anthropic-key")
+async def set_anthropic_key(body: AnthropicKeyRequest, user: dict = Depends(get_current_user)):
+    key = body.api_key.strip()
+    if not key.startswith("sk-ant-"):
+        raise HTTPException(status_code=400, detail="That doesn't look like a valid Anthropic API key")
+    encrypted = encrypt_api_key(key)
+    await db.users.update_one({"_id": user["_id"]}, {"$set": {"anthropic_api_key_encrypted": encrypted}})
+    return {"configured": True}
+
+@api.delete("/settings/anthropic-key")
+async def clear_anthropic_key(user: dict = Depends(get_current_user)):
+    await db.users.update_one({"_id": user["_id"]}, {"$unset": {"anthropic_api_key_encrypted": ""}})
+    return {"configured": False}
+
 @api.get("/assistant/history")
 async def assistant_history(user: dict = Depends(get_current_user)):
     uid = str(user["_id"])
@@ -472,20 +497,45 @@ async def assistant_chat(body: ChatMessage, user: dict = Depends(get_current_use
         convo = "\n".join(f"{m['role'].upper()}: {m['content']}" for m in prior)
         context += "\n\nRecent conversation:\n" + convo
 
-    from emergentintegrations.llm.chat import LlmChat, UserMessage, TextDelta, StreamDone
+    encrypted_key = user.get("anthropic_api_key_encrypted")
+    own_key = None
+    if encrypted_key:
+        try:
+            own_key = decrypt_api_key(encrypted_key)
+        except ValueError:
+            # Corrupt/unreadable stored key (e.g. rotated encryption secret) — fall back to
+            # the platform-shared key rather than failing the request.
+            own_key = None
 
-    chat = LlmChat(api_key=EMERGENT_LLM_KEY, session_id=f"sentinel-{uid}",
-                   system_message=context).with_model("anthropic", "claude-sonnet-4-6")
+    async def stream_own_key():
+        client_anthropic = anthropic.AsyncAnthropic(api_key=own_key)
+        async with client_anthropic.messages.stream(
+            model="claude-sonnet-4-6",
+            max_tokens=4096,
+            system=context,
+            messages=[{"role": "user", "content": body.message}],
+        ) as stream:
+            async for text in stream.text_stream:
+                yield text
+
+    async def stream_shared_key():
+        from emergentintegrations.llm.chat import LlmChat, UserMessage, TextDelta, StreamDone
+
+        chat = LlmChat(api_key=EMERGENT_LLM_KEY, session_id=f"sentinel-{uid}",
+                       system_message=context).with_model("anthropic", "claude-sonnet-4-6")
+        async for event in chat.stream_message(UserMessage(text=body.message)):
+            if isinstance(event, TextDelta):
+                yield event.content
+            elif isinstance(event, StreamDone):
+                break
 
     async def gen():
         full = ""
         try:
-            async for event in chat.stream_message(UserMessage(text=body.message)):
-                if isinstance(event, TextDelta):
-                    full += event.content
-                    yield f"data: {json.dumps({'delta': event.content})}\n\n"
-                elif isinstance(event, StreamDone):
-                    break
+            source = stream_own_key() if own_key else stream_shared_key()
+            async for delta in source:
+                full += delta
+                yield f"data: {json.dumps({'delta': delta})}\n\n"
         except Exception as e:
             yield f"data: {json.dumps({'error': str(e)})}\n\n"
         await db.chat_messages.insert_one({"user_id": uid, "role": "assistant",
