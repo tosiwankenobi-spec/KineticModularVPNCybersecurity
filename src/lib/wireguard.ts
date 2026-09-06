@@ -51,7 +51,7 @@ DNS = ${dns}
 [Peer]
 PublicKey = ${serverPublicKey}
 Endpoint = ${endpoint}
-AllowedIPs = 0.0.0.0/0
+AllowedIPs = 0.0.0.0/0, ::/0
 PersistentKeepalive = 25
 `;
 }

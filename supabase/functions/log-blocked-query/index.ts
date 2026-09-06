@@ -33,10 +33,7 @@ Deno.serve(async (req: Request) => {
   const domain = body?.domain as string | undefined;
   const category = body?.category as string | undefined;
   if (!clientIp || !domain || !category) {
-    return jsonResponse(
-      { error: "client_ip, domain, and category are required" },
-      { status: 400 },
-    );
+    return jsonResponse({ error: "client_ip, domain, and category are required" }, { status: 400 });
   }
 
   const supabaseUrl = Deno.env.get("SUPABASE_URL")!;

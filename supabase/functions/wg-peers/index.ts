@@ -81,9 +81,12 @@ Deno.serve(async (req: Request) => {
   const relayUrl = Deno.env.get("RELAY_URL");
   const relaySecret = Deno.env.get("RELAY_SHARED_SECRET");
   if (!relayUrl || !relaySecret) {
-    return jsonResponse({ error: "Relay is not configured yet" }, {
-      status: 503,
-    });
+    return jsonResponse(
+      { error: "Relay is not configured yet" },
+      {
+        status: 503,
+      },
+    );
   }
 
   if (action === "register") {
@@ -102,16 +105,17 @@ Deno.serve(async (req: Request) => {
       return jsonResponse({ error: listError.message }, { status: 500 });
     }
     const used = new Set(
-      (existing ?? []).map((row: { allowed_ip: string }) =>
-        Number(row.allowed_ip.split(".")[3]),
-      ),
+      (existing ?? []).map((row: { allowed_ip: string }) => Number(row.allowed_ip.split(".")[3])),
     );
     let octet = FIRST_CLIENT_OCTET;
     while (used.has(octet) && octet <= LAST_CLIENT_OCTET) octet++;
     if (octet > LAST_CLIENT_OCTET) {
-      return jsonResponse({ error: "Relay tunnel subnet is full" }, {
-        status: 503,
-      });
+      return jsonResponse(
+        { error: "Relay tunnel subnet is full" },
+        {
+          status: 503,
+        },
+      );
     }
     const allowedIp = `${TUNNEL_SUBNET_PREFIX}${octet}`;
 
@@ -122,9 +126,12 @@ Deno.serve(async (req: Request) => {
       body: JSON.stringify({ public_key: publicKey, allowed_ip: allowedIp }),
     });
     if (!relayResp.ok) {
-      return jsonResponse({ error: "Relay rejected the new peer" }, {
-        status: 502,
-      });
+      return jsonResponse(
+        { error: "Relay rejected the new peer" },
+        {
+          status: 502,
+        },
+      );
     }
 
     const { error: insertError } = await admin.from("wg_peers").insert({

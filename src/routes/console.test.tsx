@@ -53,7 +53,7 @@ vi.mock("../lib/auth", () => ({
 // every call is recorded for assertions.
 type Call = { table: string; op: string; args: unknown[] };
 
-const { calls, responses, fromMock } = vi.hoisted(() => {
+const { calls, responses, fromMock, channel, removeChannel } = vi.hoisted(() => {
   const calls: Call[] = [];
   const responses: Record<string, { data: unknown; error: unknown }> = {};
 
@@ -94,11 +94,22 @@ const { calls, responses, fromMock } = vi.hoisted(() => {
   }
 
   const fromMock = vi.fn((table: string) => makeBuilder(table));
-  return { calls, responses, fromMock };
+
+  // Minimal chainable fake for the Realtime channel console.tsx subscribes
+  // to (`.channel(...).on(...).subscribe()`) plus the `.removeChannel(...)`
+  // cleanup call — neither is exercised by these tests, they just need to
+  // exist so the subscription effect doesn't throw.
+  const channelMock: Record<string, unknown> = {};
+  channelMock.on = vi.fn(() => channelMock);
+  channelMock.subscribe = vi.fn(() => channelMock);
+  const channel = vi.fn(() => channelMock);
+  const removeChannel = vi.fn();
+
+  return { calls, responses, fromMock, channel, removeChannel };
 });
 
 vi.mock("../lib/supabase", () => ({
-  supabase: { from: fromMock },
+  supabase: { from: fromMock, channel, removeChannel },
 }));
 
 // Import Console's route *after* the mocks above are registered.
