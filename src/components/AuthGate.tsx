@@ -20,6 +20,18 @@ export function AuthGate({ children }: { children: ReactNode }) {
   return <>{children}</>;
 }
 
+// Mirrors the Supabase project's password policy (8+ characters, upper +
+// lower case, a digit, and a symbol) so a weak password gets a specific,
+// friendly message here instead of Supabase's raw 422 error text.
+function getPasswordError(password: string): string | null {
+  if (password.length < 8) return "Password must be at least 8 characters.";
+  if (!/[a-z]/.test(password)) return "Password must include a lowercase letter.";
+  if (!/[A-Z]/.test(password)) return "Password must include an uppercase letter.";
+  if (!/[0-9]/.test(password)) return "Password must include a number.";
+  if (!/[^A-Za-z0-9]/.test(password)) return "Password must include a symbol.";
+  return null;
+}
+
 function AuthForm() {
   const { signInWithPassword, signUpWithPassword } = useAuth();
   const [mode, setMode] = useState<"signin" | "signup">("signin");
@@ -39,6 +51,11 @@ function AuthForm() {
         if (error) setError(error);
         else toast.success("Welcome back");
       } else {
+        const passwordError = getPasswordError(password);
+        if (passwordError) {
+          setError(passwordError);
+          return;
+        }
         const { error, needsEmailConfirmation } = await signUpWithPassword(
           email,
           password,
@@ -47,7 +64,12 @@ function AuthForm() {
         if (error) {
           setError(error);
         } else if (needsEmailConfirmation) {
-          toast.success("Check your email to confirm your account");
+          // Supabase gives the same response whether this is a brand-new
+          // signup awaiting confirmation or a repeat signup on an
+          // already-registered address (no email is sent in the latter
+          // case, by design, to avoid leaking which emails are registered)
+          // — so the copy here has to stay honest about both possibilities.
+          toast.success("If that's a new address, check your email to confirm your account");
           setMode("signin");
         } else {
           toast.success("Account created");
@@ -124,12 +146,17 @@ function AuthForm() {
               id="auth-password"
               type="password"
               required
-              minLength={6}
+              minLength={mode === "signup" ? 8 : undefined}
               value={password}
               onChange={(e) => setPassword(e.target.value)}
               className="w-full rounded-md border border-border bg-background px-3 py-2 text-sm outline-none focus-visible:border-primary focus-visible:ring-2 focus-visible:ring-primary/40"
               placeholder="••••••••"
             />
+            {mode === "signup" && (
+              <p className="mt-1 text-[10px] text-muted-foreground">
+                At least 8 characters, with uppercase, lowercase, a number, and a symbol.
+              </p>
+            )}
           </div>
 
           {error && (
