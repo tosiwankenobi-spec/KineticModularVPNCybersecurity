@@ -52,6 +52,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       password,
       options: {
         data: displayName ? { display_name: displayName } : undefined,
+        emailRedirectTo: window.location.origin,
       },
     });
     return {
