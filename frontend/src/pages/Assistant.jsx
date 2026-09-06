@@ -1,7 +1,7 @@
 import React, { useEffect, useRef, useState } from "react";
-import { Send, MessageSquareLock, Trash2, ShieldCheck } from "lucide-react";
+import { Send, MessageSquareLock, Trash2, ShieldCheck, KeyRound, X } from "lucide-react";
 import { toast } from "sonner";
-import api, { API } from "../lib/api";
+import api, { API, formatApiErrorDetail } from "../lib/api";
 
 const SUGGESTIONS = [
   "How do I know if my device is infected?",
@@ -14,6 +14,10 @@ export default function Assistant() {
   const [messages, setMessages] = useState([]);
   const [input, setInput] = useState("");
   const [streaming, setStreaming] = useState(false);
+  const [keyConfigured, setKeyConfigured] = useState(false);
+  const [showKeyPanel, setShowKeyPanel] = useState(false);
+  const [keyInput, setKeyInput] = useState("");
+  const [keySaving, setKeySaving] = useState(false);
   const scrollRef = useRef(null);
 
   const scrollToBottom = () => {
@@ -30,7 +34,43 @@ export default function Assistant() {
         scrollToBottom();
       } catch { /* noop */ }
     })();
+    (async () => {
+      try {
+        const { data } = await api.get("/settings/anthropic-key");
+        setKeyConfigured(data.configured);
+      } catch { /* noop */ }
+    })();
   }, []);
+
+  const saveKey = async () => {
+    const key = keyInput.trim();
+    if (!key) return;
+    setKeySaving(true);
+    try {
+      await api.post("/settings/anthropic-key", { api_key: key });
+      setKeyConfigured(true);
+      setKeyInput("");
+      setShowKeyPanel(false);
+      toast.success("Your Anthropic API key is now in use for this assistant");
+    } catch (err) {
+      toast.error(formatApiErrorDetail(err?.response?.data?.detail));
+    } finally {
+      setKeySaving(false);
+    }
+  };
+
+  const removeKey = async () => {
+    setKeySaving(true);
+    try {
+      await api.delete("/settings/anthropic-key");
+      setKeyConfigured(false);
+      toast.success("Removed your API key. Using the shared assistant key.");
+    } catch {
+      toast.error("Failed to remove key");
+    } finally {
+      setKeySaving(false);
+    }
+  };
 
   const send = async (text) => {
     const msg = (text ?? input).trim();
@@ -106,12 +146,65 @@ export default function Assistant() {
             <span className="w-2 h-2 rounded-full bg-accent" /> Powered by Claude Sonnet 4.6
           </p>
         </div>
-        {messages.length > 0 && (
-          <button onClick={clear} data-testid="clear-chat-btn" className="flex items-center gap-2 text-muted hover:text-threat transition-colors text-sm font-mono">
-            <Trash2 size={16} /> Clear
+        <div className="flex items-center gap-4">
+          <button
+            onClick={() => setShowKeyPanel((v) => !v)}
+            data-testid="api-key-btn"
+            className={`flex items-center gap-2 text-sm font-mono transition-colors ${keyConfigured ? "text-accent" : "text-muted hover:text-white"}`}
+          >
+            <KeyRound size={16} /> {keyConfigured ? "Using your key" : "Use your own key"}
           </button>
-        )}
+          {messages.length > 0 && (
+            <button onClick={clear} data-testid="clear-chat-btn" className="flex items-center gap-2 text-muted hover:text-threat transition-colors text-sm font-mono">
+              <Trash2 size={16} /> Clear
+            </button>
+          )}
+        </div>
       </div>
+
+      {showKeyPanel && (
+        <div className="mb-4 border border-border bg-surface rounded-sm p-4 fade-up" data-testid="api-key-panel">
+          <div className="flex items-center justify-between mb-3">
+            <h3 className="font-heading font-bold text-sm">Bring your own Anthropic API key</h3>
+            <button onClick={() => setShowKeyPanel(false)} className="text-muted hover:text-white">
+              <X size={16} />
+            </button>
+          </div>
+          <p className="text-muted text-xs mb-3 leading-relaxed">
+            By default the assistant runs on SENTINEL's shared key. Add your own Anthropic API key
+            (starts with <code>sk-ant-</code>) to route your conversations through it instead. It's
+            encrypted before storage and never shown again.
+          </p>
+          <div className="flex items-center gap-2">
+            <input
+              type="password"
+              value={keyInput}
+              onChange={(e) => setKeyInput(e.target.value)}
+              placeholder={keyConfigured ? "Key configured — enter a new one to replace it" : "sk-ant-..."}
+              data-testid="api-key-input"
+              className="flex-1 bg-bg border border-border focus:border-accent outline-none px-3 py-2 rounded-sm text-white text-sm transition-colors"
+            />
+            <button
+              onClick={saveKey}
+              disabled={keySaving || !keyInput.trim()}
+              data-testid="api-key-save-btn"
+              className="bg-accent text-black px-4 py-2 rounded-sm text-sm font-medium hover:bg-[#00c985] transition-colors disabled:opacity-50"
+            >
+              Save
+            </button>
+            {keyConfigured && (
+              <button
+                onClick={removeKey}
+                disabled={keySaving}
+                data-testid="api-key-remove-btn"
+                className="text-threat text-sm font-mono px-3 py-2 hover:underline disabled:opacity-50"
+              >
+                Remove
+              </button>
+            )}
+          </div>
+        </div>
+      )}
 
       <div ref={scrollRef} className="flex-1 overflow-y-auto border border-border bg-surface rounded-sm p-5 mb-4" data-testid="chat-window">
         {messages.length === 0 ? (
