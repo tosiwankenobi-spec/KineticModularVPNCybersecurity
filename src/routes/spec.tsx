@@ -65,19 +65,27 @@ function Spec() {
             tunnel on its own, which is why this is a download-and-import step rather than a button
             inside the console itself.
           </p>
+          <p className="mt-3 text-sm text-muted-foreground">
+            The "Encrypted Tunnel" card in the console is also real, not simulated: it polls a{" "}
+            <code className="text-mono">wg-peers</code> "status" action every 15 seconds, which asks
+            the relay to run <code className="text-mono">wg show wg0 dump</code> and reports back
+            each of your registered peers' actual handshake state. "Connected" means the relay saw a
+            WireGuard handshake from your device within the last 3 minutes — not a stored
+            preference, and not a value the console can fake.
+          </p>
         </section>
 
         <section className="mt-8">
           <h2 className="text-lg font-semibold">What's simulated (for now)</h2>
           <p className="mt-2 text-sm text-muted-foreground">
-            Everything inside the console itself — the module toggles (malware shield, tracker
+            Everything else inside the console — the other module toggles (malware shield, tracker
             blocker, adaptive firewall, etc.), the live threat-event feed, and the region picker —
-            is still simulated. Toggling a module updates real, persisted state and generates
-            realistic sample events, but none of it inspects or routes real traffic yet, and it's
-            entirely separate from the one real relay described above. There is currently one relay
-            node, not the four regions listed below — those remain illustrative until more relays
-            are provisioned and the module logic is actually wired to run against real traffic
-            through them.
+            is still simulated. Toggling one of those modules updates real, persisted state and
+            generates realistic sample events, but none of it inspects or routes real traffic yet,
+            and it's entirely separate from the one real relay described above. There is currently
+            one relay node, not the four regions listed below — those remain illustrative until more
+            relays are provisioned and the module logic is actually wired to run against real
+            traffic through them.
           </p>
         </section>
 
@@ -153,13 +161,29 @@ function Spec() {
         <section className="mt-8">
           <h2 className="text-lg font-semibold">Relay peer registration</h2>
           <p className="mt-2 text-sm text-muted-foreground">
-            The relay VM runs a small internal HTTP service (Flask, systemd-managed) that adds or
-            removes WireGuard peers on its live interface. The Supabase Edge Function{" "}
-            <code className="text-mono">wg-peers</code> is the only caller, authenticated with a
-            shared secret set as a Supabase secret — never exposed to the browser. Known tradeoff,
-            disclosed rather than hidden: that service listens on a public port protected by the
-            shared secret rather than an IP allowlist, since Supabase Edge Functions don't publish a
-            stable outbound IP range to restrict it to.
+            The relay VM runs a small internal service (Flask, under gunicorn, systemd-managed) that
+            adds, removes, and reports the live status of WireGuard peers on its interface. It's
+            bound to localhost only —{" "}
+            
+              href="https://caddyserver.com/"
+              target="_blank"
+              rel="noreferrer"
+              className="underline hover:text-foreground"
+            >
+              Caddy
+            </a>{" "}
+            terminates HTTPS on the public side and reverse-proxies in, so the process that actually
+            runs <code className="text-mono">wg</code> as root is never directly reachable from the
+            internet. The Supabase Edge Function <code className="text-mono">wg-peers</code> is the
+            only caller, authenticated with a shared secret set as a Supabase secret — never exposed
+            to the browser — and both sides independently reject anything that isn't a well-formed
+            WireGuard key before it's used.
+          </p>
+          <p className="mt-3 text-sm text-muted-foreground">
+            Known tradeoff, disclosed rather than hidden: the shared secret is still the actual
+            access control, not an IP allowlist, since Supabase Edge Functions don't publish a
+            stable outbound IP range to restrict ingress to. TLS and the localhost bind are defense
+            in depth on top of that, not a replacement for it.
           </p>
         </section>
 
