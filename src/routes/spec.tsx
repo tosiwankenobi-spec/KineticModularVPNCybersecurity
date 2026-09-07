@@ -164,7 +164,7 @@ function Spec() {
             The relay VM runs a small internal service (Flask, under gunicorn, systemd-managed) that
             adds, removes, and reports the live status of WireGuard peers on its interface. It's
             bound to localhost only —{" "}
-            
+            <a
               href="https://caddyserver.com/"
               target="_blank"
               rel="noreferrer"

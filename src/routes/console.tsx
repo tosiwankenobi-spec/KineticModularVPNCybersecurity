@@ -35,11 +35,36 @@ type Alert = {
   read: boolean;
 };
 
+// The tunnel's on/off state used to be a user preference like every other
+// module, but it's now derived from the relay's real WireGuard handshake
+// status (see the `status` action on the wg-peers Edge Function) — so it's
+// excluded from the toggleable set, from `module_settings` persistence, and
+// from the modules grid's switches.
+type ToggleModuleId = Exclude<ModuleId, "tunnel">;
+const TOGGLE_MODULES = MODULES.filter((m) => m.id !== "tunnel") as Array<
+  Module & { id: ToggleModuleId }
+>;
+const TUNNEL_MODULE = MODULES.find((m) => m.id === "tunnel")!;
+
+type TunnelPeer = {
+  public_key: string;
+  allowed_ip: string;
+  label: string | null;
+  registered: boolean;
+  connected: boolean;
+  latest_handshake: number | null;
+};
+
 function Console() {
   const { user, signOut } = useAuth();
-  const [enabled, setEnabled] = useState<Record<ModuleId, boolean>>(() =>
-    MODULES.reduce((acc, m) => ({ ...acc, [m.id]: m.defaultOn }), {} as Record<ModuleId, boolean>),
+  const [enabled, setEnabled] = useState<Record<ToggleModuleId, boolean>>(() =>
+    TOGGLE_MODULES.reduce(
+      (acc, m) => ({ ...acc, [m.id]: m.defaultOn }),
+      {} as Record<ToggleModuleId, boolean>,
+    ),
   );
+  // null = status hasn't loaded yet; [] = loaded, no devices registered.
+  const [tunnelPeers, setTunnelPeers] = useState<TunnelPeer[] | null>(null);
   const [region, setRegion] = useState(REGIONS[0]);
   const [alerts, setAlerts] = useState<Alert[]>([]);
   const [centerOpen, setCenterOpen] = useState(false);
@@ -69,13 +94,13 @@ function Console() {
           const next = { ...prev };
           for (const row of data) {
             if (row.module_id in next) {
-              next[row.module_id as ModuleId] = row.enabled;
+              next[row.module_id as ToggleModuleId] = row.enabled;
             }
           }
           return next;
         });
       } else {
-        const defaults = MODULES.map((m) => ({
+        const defaults = TOGGLE_MODULES.map((m) => ({
           user_id: user.id,
           module_id: m.id,
           enabled: m.defaultOn,
@@ -90,6 +115,30 @@ function Console() {
       cancelled = true;
     };
   }, [user]);
+
+  // Poll the relay (via the wg-peers Edge Function) for this user's real
+  // WireGuard connection status — registered peers and whether each has a
+  // recent handshake. 15s balances freshness against load; a handshake is
+  // required at least every 120s (WireGuard's REKEY_AFTER_TIME) while a
+  // client is actually connected, so this polling interval comfortably
+  // catches a state change.
+  const fetchTunnelStatus = useCallback(async () => {
+    const { data, error } = await supabase.functions.invoke("wg-peers", {
+      body: { action: "status" },
+    });
+    if (error) {
+      console.error(error);
+      return;
+    }
+    setTunnelPeers((data as { peers: TunnelPeer[] } | null)?.peers ?? []);
+  }, []);
+
+  useEffect(() => {
+    if (!user) return;
+    fetchTunnelStatus();
+    const interval = setInterval(fetchTunnelStatus, 15_000);
+    return () => clearInterval(interval);
+  }, [user, fetchTunnelStatus]);
 
   // Load this user's alert history from Supabase.
   useEffect(() => {
@@ -156,19 +205,38 @@ function Console() {
     }
   }, []);
 
-  const activeCount = useMemo(() => Object.values(enabled).filter(Boolean).length, [enabled]);
+  // Real tunnel state, derived from the relay poll above rather than a
+  // stored preference.
+  const hasTunnelDevice = (tunnelPeers?.length ?? 0) > 0;
+  const tunnelConnected = tunnelPeers?.some((p) => p.connected) ?? false;
+  const latestTunnelHandshake = useMemo(() => {
+    if (!tunnelPeers) return null;
+    return tunnelPeers.reduce<number | null>((latest, p) => {
+      if (p.latest_handshake == null) return latest;
+      return latest == null || p.latest_handshake > latest ? p.latest_handshake : latest;
+    }, null);
+  }, [tunnelPeers]);
+
+  const activeCount = useMemo(
+    () => Object.values(enabled).filter(Boolean).length + (tunnelConnected ? 1 : 0),
+    [enabled, tunnelConnected],
+  );
   const load = useMemo(
-    () => MODULES.reduce((sum, m) => (enabled[m.id] ? sum + m.loadMb : sum), 0),
-    [enabled],
+    () =>
+      TOGGLE_MODULES.reduce((sum, m) => (enabled[m.id] ? sum + m.loadMb : sum), 0) +
+      (tunnelConnected ? TUNNEL_MODULE.loadMb : 0),
+    [enabled, tunnelConnected],
   );
   const latency = useMemo(
-    () => MODULES.reduce((sum, m) => (enabled[m.id] ? sum + m.latencyMs : sum), 0) + region.ping,
-    [enabled, region],
+    () =>
+      TOGGLE_MODULES.reduce((sum, m) => (enabled[m.id] ? sum + m.latencyMs : sum), 0) +
+      (tunnelConnected ? TUNNEL_MODULE.latencyMs : 0) +
+      region.ping,
+    [enabled, tunnelConnected, region],
   );
-  const tunnelOn = enabled.tunnel;
   const unread = alerts.filter((a) => !a.read).length;
 
-  const persistModuleSetting = (id: ModuleId, on: boolean) => {
+  const persistModuleSetting = (id: ToggleModuleId, on: boolean) => {
     const uid = userIdRef.current;
     if (!uid) return;
     supabase
@@ -187,20 +255,13 @@ function Console() {
       });
   };
 
-  const toggle = (id: ModuleId) => {
+  const toggle = (id: ToggleModuleId) => {
     setEnabled((prev) => {
       const next = { ...prev, [id]: !prev[id] };
-      const mod = MODULES.find((m) => m.id === id)!;
+      const mod = TOGGLE_MODULES.find((m) => m.id === id)!;
       const nowOn = next[id];
       persistModuleSetting(id, nowOn);
-      if (id === "tunnel" && !nowOn) {
-        pushAlert({
-          level: "danger",
-          moduleId: id,
-          title: "Tunnel disconnected",
-          detail: "Encrypted tunnel offline — traffic is no longer routed through relays.",
-        });
-      } else if (nowOn) {
+      if (nowOn) {
         pushAlert({
           level: "success",
           moduleId: id,
@@ -221,9 +282,12 @@ function Console() {
 
   const setAll = (on: boolean) => {
     setEnabled(
-      MODULES.reduce((acc, m) => ({ ...acc, [m.id]: on }), {} as Record<ModuleId, boolean>),
+      TOGGLE_MODULES.reduce(
+        (acc, m) => ({ ...acc, [m.id]: on }),
+        {} as Record<ToggleModuleId, boolean>,
+      ),
     );
-    MODULES.forEach((m) => persistModuleSetting(m.id, on));
+    TOGGLE_MODULES.forEach((m) => persistModuleSetting(m.id, on));
     pushAlert({
       level: on ? "success" : "warn",
       title: on ? "All modules engaged" : "All modules disabled",
@@ -384,12 +448,23 @@ function Console() {
           <div className="mb-6 inline-flex items-center gap-2 rounded-full border border-primary/30 bg-primary/10 px-3 py-1">
             <span
               className={`size-1.5 rounded-full ${
-                tunnelOn ? "bg-primary animate-pulse" : "bg-muted-foreground"
+                tunnelConnected ? "bg-primary animate-pulse" : "bg-muted-foreground"
               }`}
             />
             <span className="text-mono text-[10px] uppercase text-primary">
-              {tunnelOn ? "Tunnel Active" : "Tunnel Offline"}
+              {tunnelPeers === null
+                ? "Checking Tunnel…"
+                : !hasTunnelDevice
+                  ? "No Device Registered"
+                  : tunnelConnected
+                    ? "Tunnel Active"
+                    : "Tunnel Offline"}
             </span>
+            {tunnelConnected && latestTunnelHandshake != null && (
+              <span className="text-mono text-[10px] text-primary/70">
+                · last handshake {formatRelativeTime(latestTunnelHandshake * 1000)}
+              </span>
+            )}
           </div>
 
           <h1 className="max-w-2xl text-balance text-3xl font-semibold leading-tight sm:text-5xl">
@@ -418,16 +493,20 @@ function Console() {
           </div>
 
           <div className="mt-4 flex flex-wrap items-center gap-2">
-            <button
-              onClick={() => toggle("tunnel")}
-              className={`text-mono rounded-md px-4 py-2 text-xs font-semibold uppercase transition ${
-                tunnelOn
+            <Link
+              to="/account"
+              className={`text-mono inline-block rounded-md px-4 py-2 text-xs font-semibold uppercase transition ${
+                tunnelConnected
                   ? "bg-primary text-primary-foreground glow-primary"
                   : "border border-border bg-surface text-foreground hover:bg-surface-2"
               }`}
             >
-              {tunnelOn ? "Tunnel Engaged" : "Engage Tunnel"}
-            </button>
+              {!hasTunnelDevice
+                ? "Register a Device"
+                : tunnelConnected
+                  ? "Tunnel Engaged"
+                  : "Manage Devices"}
+            </Link>
             <button
               onClick={() => setAll(true)}
               className="text-mono rounded-md border border-border bg-surface px-3 py-2 text-[10px] uppercase text-muted-foreground hover:text-foreground"
@@ -468,14 +547,25 @@ function Console() {
                   <div className="h-px flex-1 bg-border" />
                 </div>
                 <div className="grid gap-3 sm:grid-cols-2">
-                  {items.map((m) => (
-                    <ModuleCard
-                      key={m.id}
-                      module={m}
-                      on={enabled[m.id]}
-                      onToggle={() => toggle(m.id)}
-                    />
-                  ))}
+                  {items.map((m) =>
+                    m.id === "tunnel" ? (
+                      <TunnelStatusCard
+                        key={m.id}
+                        module={m}
+                        loading={tunnelPeers === null}
+                        hasDevice={hasTunnelDevice}
+                        connected={tunnelConnected}
+                        latestHandshake={latestTunnelHandshake}
+                      />
+                    ) : (
+                      <ModuleCard
+                        key={m.id}
+                        module={m}
+                        on={enabled[m.id as ToggleModuleId]}
+                        onToggle={() => toggle(m.id as ToggleModuleId)}
+                      />
+                    ),
+                  )}
                 </div>
               </div>
             );
@@ -692,6 +782,63 @@ function StatTile({
       <div className="mt-2 flex items-baseline gap-2">
         <span className={`text-3xl font-semibold tabular-nums ${toneClass}`}>{value}</span>
         <span className="text-mono text-[10px] uppercase text-muted-foreground">{hint}</span>
+      </div>
+    </div>
+  );
+}
+
+function TunnelStatusCard({
+  module,
+  loading,
+  hasDevice,
+  connected,
+  latestHandshake,
+}: {
+  module: Module;
+  loading: boolean;
+  hasDevice: boolean;
+  connected: boolean;
+  latestHandshake: number | null;
+}) {
+  const statusLabel = loading
+    ? "Checking…"
+    : !hasDevice
+      ? "No Device"
+      : connected
+        ? "Connected"
+        : "Offline";
+  return (
+    <div
+      className={`group relative rounded-lg border p-4 transition ${
+        connected ? "border-primary/40 bg-surface" : "border-border bg-surface/50"
+      }`}
+    >
+      <div className="flex items-start justify-between gap-4">
+        <div className="min-w-0">
+          <div className="flex items-center gap-2">
+            <span
+              className={`size-1.5 rounded-full ${
+                connected ? "bg-primary animate-pulse" : "bg-muted-foreground/60"
+              }`}
+            />
+            <h3 className="text-base font-medium">{module.name}</h3>
+          </div>
+          <p className="mt-2 text-sm text-muted-foreground text-pretty">{module.description}</p>
+          <div className="text-mono mt-3 flex flex-wrap gap-x-4 gap-y-1 text-[10px] uppercase text-muted-foreground">
+            <span>{module.loadMb}MB</span>
+            <span>+{module.latencyMs}ms</span>
+            <span className={connected ? "text-primary" : ""}>{statusLabel}</span>
+            {connected && latestHandshake != null && (
+              <span>handshake {formatRelativeTime(latestHandshake * 1000)}</span>
+            )}
+          </div>
+        </div>
+        <Link
+          to="/account"
+          className="text-mono shrink-0 rounded-md border border-border bg-surface-2 px-2 py-1.5 text-[10px] uppercase text-muted-foreground hover:text-foreground"
+        >
+          {hasDevice ? "Manage" : "Connect"}
+        </Link>
       </div>
     </div>
   );

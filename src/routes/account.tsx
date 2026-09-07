@@ -1,10 +1,23 @@
 import { createFileRoute, Link } from "@tanstack/react-router";
 import { useEffect, useState, type FormEvent } from "react";
 import { toast } from "sonner";
+import QRCode from "qrcode";
 import { supabase, type ProfileRow, type WgPeerRow } from "../lib/supabase";
 import { useAuth } from "../lib/auth";
 import { AuthGate } from "../components/AuthGate";
 import { generateWgKeyPair, buildWgClientConfig } from "../lib/wireguard";
+
+// Shared by the auto-download on generation and the "download again" button
+// in the QR panel below — keeps the actual file-save mechanics in one place.
+function downloadConfigFile(config: string) {
+  const blob = new Blob([config], { type: "text/plain" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = "kinetic-relay.conf";
+  a.click();
+  URL.revokeObjectURL(url);
+}
 
 export const Route = createFileRoute("/account")({
   head: () => ({
@@ -34,6 +47,14 @@ function Account() {
   const [loadingPeers, setLoadingPeers] = useState(true);
   const [generatingPeer, setGeneratingPeer] = useState(false);
   const [revokingId, setRevokingId] = useState<string | null>(null);
+  // The just-generated config, held only in memory so we can render a QR
+  // code and a "download again" button — never persisted or sent anywhere,
+  // same as the private key it contains. Cleared once the user is done with
+  // it (or navigates away, which drops this state entirely).
+  const [newDeviceConfig, setNewDeviceConfig] = useState<{
+    text: string;
+    qrDataUrl: string;
+  } | null>(null);
 
   const loadPeers = async (uid: string) => {
     const { data, error } = await supabase
@@ -78,6 +99,7 @@ function Account() {
   const generateDeviceConfig = async () => {
     if (!user) return;
     setGeneratingPeer(true);
+    setNewDeviceConfig(null);
     try {
       const { publicKey, privateKey } = generateWgKeyPair();
       const {
@@ -108,15 +130,15 @@ function Account() {
         endpoint,
         dns: "10.8.0.1",
       });
-      const blob = new Blob([config], { type: "text/plain" });
-      const url = URL.createObjectURL(blob);
-      const a = document.createElement("a");
-      a.href = url;
-      a.download = "kinetic-relay.conf";
-      a.click();
-      URL.revokeObjectURL(url);
+      downloadConfigFile(config);
+      // The QR encodes the exact same .conf text (private key included) so
+      // the official WireGuard app's "Create from QR code" import produces
+      // an identical tunnel to importing the downloaded file — generated
+      // entirely client-side, same as the keypair itself.
+      const qrDataUrl = await QRCode.toDataURL(config, { width: 288, margin: 1 });
+      setNewDeviceConfig({ text: config, qrDataUrl });
       toast.success("Config downloaded", {
-        description: "Import kinetic-relay.conf into the WireGuard app to connect for real.",
+        description: "Import kinetic-relay.conf into the WireGuard app, or scan the QR code below.",
       });
       loadPeers(user.id);
     } catch (err) {
@@ -131,14 +153,25 @@ function Account() {
   const revokePeer = async (peer: WgPeerRow) => {
     setRevokingId(peer.id);
     try {
-      const { error } = await supabase.functions.invoke("wg-peers", {
+      const { data, error } = await supabase.functions.invoke("wg-peers", {
         body: { action: "revoke", public_key: peer.public_key },
       });
       if (error) {
         toast.error("Couldn't revoke this device", { description: error.message });
         return;
       }
-      toast.success("Device revoked");
+      // Access is already cut off on our side either way (the peer's row is
+      // revoked), but if the relay itself couldn't be reached, that key
+      // could still be live on the tunnel until it's cleaned up there too —
+      // worth telling the user rather than implying it's fully disconnected.
+      if ((data as { relay_cleanup_failed?: boolean } | null)?.relay_cleanup_failed) {
+        toast.warning("Removed from your account", {
+          description:
+            "Couldn't reach the relay to remove this device there — its key may still work on the tunnel until it's cleaned up on the relay directly.",
+        });
+      } else {
+        toast.success("Device revoked");
+      }
       setPeers((prev) => prev.filter((p) => p.id !== peer.id));
     } finally {
       setRevokingId(null);
@@ -352,6 +385,36 @@ function Account() {
           >
             {generatingPeer ? "Registering with relay…" : "Generate new device config"}
           </button>
+
+          {newDeviceConfig && (
+            <div className="mt-4 rounded-md border border-primary/40 bg-background p-4 text-center">
+              <p className="text-sm font-medium">Scan to import on mobile</p>
+              <p className="mx-auto mt-1 max-w-sm text-xs text-muted-foreground">
+                Open the WireGuard app, tap "+", choose "Create from QR code," and scan this. It
+                encodes the exact same config as the downloaded file — generated in your browser,
+                never sent to us.
+              </p>
+              <img
+                src={newDeviceConfig.qrDataUrl}
+                alt="WireGuard device config QR code"
+                className="mx-auto mt-3 size-64 rounded-md border border-border bg-white p-2"
+              />
+              <div className="mt-3 flex justify-center gap-2">
+                <button
+                  onClick={() => downloadConfigFile(newDeviceConfig.text)}
+                  className="text-mono rounded-md border border-border bg-surface px-3 py-1.5 text-[10px] uppercase text-muted-foreground hover:text-foreground"
+                >
+                  Download .conf again
+                </button>
+                <button
+                  onClick={() => setNewDeviceConfig(null)}
+                  className="text-mono rounded-md bg-primary px-3 py-1.5 text-[10px] uppercase text-primary-foreground"
+                >
+                  Done
+                </button>
+              </div>
+            </div>
+          )}
 
           <div className="mt-5">
             <h3 className="text-mono text-[10px] uppercase text-muted-foreground">

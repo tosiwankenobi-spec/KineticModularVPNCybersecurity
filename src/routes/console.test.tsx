@@ -3,6 +3,11 @@ import { render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { MODULES } from "../lib/kinetic-data";
 
+// The tunnel module's on/off state is now derived from real relay status
+// (polled via supabase.functions.invoke) rather than being a toggleable
+// `module_settings` preference like every other module — see console.tsx.
+const TOGGLE_MODULES = MODULES.filter((m) => m.id !== "tunnel");
+
 // --- Mock @tanstack/react-router -------------------------------------------------
 // Console renders <Link> in its nav; real Link needs a router context we don't
 // have in a unit test. createFileRoute's return value is only used here to read
@@ -53,63 +58,73 @@ vi.mock("../lib/auth", () => ({
 // every call is recorded for assertions.
 type Call = { table: string; op: string; args: unknown[] };
 
-const { calls, responses, fromMock, channel, removeChannel } = vi.hoisted(() => {
-  const calls: Call[] = [];
-  const responses: Record<string, { data: unknown; error: unknown }> = {};
+const { calls, responses, fromMock, channel, removeChannel, invoke, invokeResult } = vi.hoisted(
+  () => {
+    const calls: Call[] = [];
+    const responses: Record<string, { data: unknown; error: unknown }> = {};
 
-  function makeBuilder(table: string) {
-    let op = "select";
-    const setOp =
-      (name: string) =>
-      (...args: unknown[]) => {
-        op = name;
-        calls.push({ table, op: name, args });
-        return builder;
+    function makeBuilder(table: string) {
+      let op = "select";
+      const setOp =
+        (name: string) =>
+        (...args: unknown[]) => {
+          op = name;
+          calls.push({ table, op: name, args });
+          return builder;
+        };
+      const chainOnly =
+        (name: string) =>
+        (...args: unknown[]) => {
+          calls.push({ table, op: `${op}.${name}`, args });
+          return builder;
+        };
+      const builder: Record<string, unknown> = {};
+      builder.select = setOp("select");
+      builder.upsert = setOp("upsert");
+      builder.update = setOp("update");
+      builder.insert = setOp("insert");
+      builder.delete = setOp("delete");
+      builder.eq = chainOnly("eq");
+      builder.order = chainOnly("order");
+      builder.limit = chainOnly("limit");
+      builder.maybeSingle = chainOnly("maybeSingle");
+      builder.then = (
+        resolve: (v: { data: unknown; error: unknown }) => unknown,
+        reject: (e: unknown) => unknown,
+      ) => {
+        const key = `${table}:${op}`;
+        const result = responses[key] ?? { data: null, error: null };
+        return Promise.resolve(result).then(resolve, reject);
       };
-    const chainOnly =
-      (name: string) =>
-      (...args: unknown[]) => {
-        calls.push({ table, op: `${op}.${name}`, args });
-        return builder;
-      };
-    const builder: Record<string, unknown> = {};
-    builder.select = setOp("select");
-    builder.upsert = setOp("upsert");
-    builder.update = setOp("update");
-    builder.insert = setOp("insert");
-    builder.delete = setOp("delete");
-    builder.eq = chainOnly("eq");
-    builder.order = chainOnly("order");
-    builder.limit = chainOnly("limit");
-    builder.maybeSingle = chainOnly("maybeSingle");
-    builder.then = (
-      resolve: (v: { data: unknown; error: unknown }) => unknown,
-      reject: (e: unknown) => unknown,
-    ) => {
-      const key = `${table}:${op}`;
-      const result = responses[key] ?? { data: null, error: null };
-      return Promise.resolve(result).then(resolve, reject);
+      return builder;
+    }
+
+    const fromMock = vi.fn((table: string) => makeBuilder(table));
+
+    // Minimal chainable fake for the Realtime channel console.tsx subscribes
+    // to (`.channel(...).on(...).subscribe()`) plus the `.removeChannel(...)`
+    // cleanup call — neither is exercised by these tests, they just need to
+    // exist so the subscription effect doesn't throw.
+    const channelMock: Record<string, unknown> = {};
+    channelMock.on = vi.fn(() => channelMock);
+    channelMock.subscribe = vi.fn(() => channelMock);
+    const channel = vi.fn(() => channelMock);
+    const removeChannel = vi.fn();
+
+    // Fake for supabase.functions.invoke — console.tsx calls this with
+    // { action: "status" } to poll real WireGuard tunnel status. Defaults to
+    // "no devices registered"; individual tests can overwrite invokeResult.current.
+    const invokeResult: { current: { data: unknown; error: unknown } } = {
+      current: { data: { peers: [] }, error: null },
     };
-    return builder;
-  }
+    const invoke = vi.fn(() => Promise.resolve(invokeResult.current));
 
-  const fromMock = vi.fn((table: string) => makeBuilder(table));
-
-  // Minimal chainable fake for the Realtime channel console.tsx subscribes
-  // to (`.channel(...).on(...).subscribe()`) plus the `.removeChannel(...)`
-  // cleanup call — neither is exercised by these tests, they just need to
-  // exist so the subscription effect doesn't throw.
-  const channelMock: Record<string, unknown> = {};
-  channelMock.on = vi.fn(() => channelMock);
-  channelMock.subscribe = vi.fn(() => channelMock);
-  const channel = vi.fn(() => channelMock);
-  const removeChannel = vi.fn();
-
-  return { calls, responses, fromMock, channel, removeChannel };
-});
+    return { calls, responses, fromMock, channel, removeChannel, invoke, invokeResult };
+  },
+);
 
 vi.mock("../lib/supabase", () => ({
-  supabase: { from: fromMock, channel, removeChannel },
+  supabase: { from: fromMock, channel, removeChannel, functions: { invoke } },
 }));
 
 // Import Console's route *after* the mocks above are registered.
@@ -120,6 +135,8 @@ beforeEach(() => {
   calls.length = 0;
   Object.keys(responses).forEach((k) => delete responses[k]);
   signOut.mockClear();
+  invoke.mockClear();
+  invokeResult.current = { data: { peers: [] }, error: null };
   // Sensible defaults: no saved settings/alerts yet (first-login path).
   responses["module_settings:select"] = { data: [], error: null };
   responses["alerts:select"] = { data: [], error: null };
@@ -136,12 +153,15 @@ describe("Console", () => {
 
     const seedCall = calls.find((c) => c.table === "module_settings" && c.op === "upsert")!;
     const seeded = seedCall.args[0] as Array<{ module_id: string; enabled: boolean }>;
-    expect(seeded).toHaveLength(MODULES.length);
-    for (const m of MODULES) {
+    expect(seeded).toHaveLength(TOGGLE_MODULES.length);
+    for (const m of TOGGLE_MODULES) {
       expect(seeded).toContainEqual(
         expect.objectContaining({ module_id: m.id, enabled: m.defaultOn }),
       );
     }
+    // The tunnel is never seeded as a preference — its state comes from the
+    // relay, not module_settings.
+    expect(seeded.some((s) => s.module_id === "tunnel")).toBe(false);
   });
 
   it("loads existing saved settings instead of re-seeding, and reflects them in the UI", async () => {
@@ -240,16 +260,50 @@ describe("Console", () => {
 
     await waitFor(() => {
       const switches = screen.getAllByRole("switch");
-      expect(switches).toHaveLength(MODULES.length);
+      expect(switches).toHaveLength(TOGGLE_MODULES.length);
       for (const s of switches) {
         expect(s).toHaveAttribute("aria-checked", "true");
       }
     });
 
     const upserts = calls.filter((c) => c.table === "module_settings" && c.op === "upsert");
-    expect(upserts).toHaveLength(MODULES.length);
+    expect(upserts).toHaveLength(TOGGLE_MODULES.length);
     for (const c of upserts) {
       expect((c.args[0] as { enabled: boolean }).enabled).toBe(true);
     }
+  });
+
+  it("shows real tunnel connection status from the relay instead of a toggle", async () => {
+    invokeResult.current = {
+      data: {
+        peers: [
+          {
+            public_key: "abc123",
+            allowed_ip: "10.8.0.2",
+            label: null,
+            registered: true,
+            connected: true,
+            latest_handshake: Math.floor(Date.now() / 1000) - 5,
+          },
+        ],
+      },
+      error: null,
+    };
+
+    render(<ConsoleRoute />);
+
+    await waitFor(() => {
+      expect(invoke).toHaveBeenCalledWith("wg-peers", { body: { action: "status" } });
+    });
+
+    // The hero pill and the modules-grid status card both reflect "connected".
+    await waitFor(() => {
+      expect(screen.getAllByText(/tunnel active/i).length).toBeGreaterThan(0);
+    });
+
+    // Tunnel never renders as a toggle switch.
+    expect(
+      screen.queryByRole("switch", { name: /toggle encrypted tunnel/i }),
+    ).not.toBeInTheDocument();
   });
 });

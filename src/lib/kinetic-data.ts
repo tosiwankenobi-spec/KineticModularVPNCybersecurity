@@ -22,7 +22,7 @@ export const MODULES: Module[] = [
     id: "tunnel",
     name: "Encrypted Tunnel",
     category: "Network",
-    description: "WireGuard-based AES-256 tunnel through hardened relay nodes.",
+    description: "WireGuard-based ChaCha20-Poly1305 tunnel through hardened relay nodes.",
     loadMb: 42,
     latencyMs: 12,
     defaultOn: true,
