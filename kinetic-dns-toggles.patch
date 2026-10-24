@@ -1,0 +1,840 @@
+diff --git a/infra/enable-dns-policy.sh b/infra/enable-dns-policy.sh
+new file mode 100755
+index 0000000..0e6402e
+--- /dev/null
++++ b/infra/enable-dns-policy.sh
+@@ -0,0 +1,62 @@
++#!/usr/bin/env bash
++# Turns on per-device DNS policy on kinetic-relay-01, which is what makes the
++# console's Tracker Blocker and Malware Shield toggles real (see the
++# "Per-device DNS policy" section of infra/relay_peer_service.py).
++#
++# Run from Cloud Shell, in the repo root, after committing the updated
++# infra/relay_peer_service.py (this script copies it from your checkout).
++#
++# Safe to re-run. Changes nothing for existing users until they flip a
++# toggle: with no policy file, every device keeps today's behaviour (the
++# relay's filtering resolver).
++set -euo pipefail
++
++PROJECT=kineticmodularvpncybersecurity
++ZONE=us-central1-a
++VM_NAME=kinetic-relay-01
++
++gcloud config set project "$PROJECT"
++
++gcloud compute scp infra/relay_peer_service.py "${VM_NAME}:~/relay_peer_service.py" --zone="$ZONE"
++
++gcloud compute ssh "$VM_NAME" --zone="$ZONE" --command="
++  set -euo pipefail
++  # conntrack lets a toggle take effect on the very next lookup (optional,
++  # the service works without it).
++  sudo apt-get install -y -qq conntrack >/dev/null || true
++  sudo mkdir -p /etc/kinetic
++  sudo mv ~/relay_peer_service.py /opt/relay_peer_service.py
++
++  # Re-create the nat rules from /etc/kinetic/dns-policy.json at boot,
++  # after WireGuard is up (iptables rules don't survive a reboot).
++  sudo tee /etc/systemd/system/kinetic-dns-policy.service >/dev/null <<'UNIT'
++[Unit]
++Description=Kinetic per-device DNS policy (iptables restore)
++After=wg-quick@wg0.service network-online.target
++Wants=network-online.target
++
++[Service]
++Type=oneshot
++WorkingDirectory=/opt
++ExecStart=/usr/bin/python3 /opt/relay_peer_service.py --apply-dns-policy
++RemainAfterExit=yes
++
++[Install]
++WantedBy=multi-user.target
++UNIT
++
++  sudo systemctl daemon-reload
++  sudo systemctl enable --now kinetic-dns-policy
++  sudo systemctl restart relay-peer-service
++  sleep 2
++  sudo systemctl is-active relay-peer-service kinetic-dns-policy
++  echo '--- KINETIC_DNS chain (empty until someone turns a toggle off) ---'
++  sudo iptables -t nat -L KINETIC_DNS -n
++  echo '--- hooks ---'
++  sudo iptables -t nat -S PREROUTING | grep KINETIC_DNS
++"
++
++echo
++echo "Done. Test: turn Tracker Blocker OFF in the console with a device connected,"
++echo "then on that device run:  nslookup doubleclick.net"
++echo "OFF -> a real IP address.  Turn it back ON -> 0.0.0.0."
+diff --git a/infra/relay_peer_service.py b/infra/relay_peer_service.py
+index f64abe8..2ea5a6b 100644
+--- a/infra/relay_peer_service.py
++++ b/infra/relay_peer_service.py
+@@ -17,15 +17,20 @@ own dev server bound to 0.0.0.0 with no TLS in front — that's what
+ harden-relay-service.sh replaces.)
+ """
+ 
++import fcntl
++import json
+ import os
+ import re
+ import subprocess
++import sys
+ import time
+ 
+ from flask import Flask, jsonify, request
+ 
+ app = Flask(__name__)
+-SHARED_SECRET = os.environ["PEER_ADD_SECRET"]
++# Only the web service needs the secret; `--apply-dns-policy` (run at boot)
++# doesn't, so don't hard-fail when it's absent in that mode.
++SHARED_SECRET = os.environ.get("PEER_ADD_SECRET")
+ 
+ # A peer is considered "connected" if it completed a WireGuard handshake
+ # within this many seconds. WireGuard re-handshakes at least every 120s
+@@ -65,7 +70,95 @@ def _valid_allowed_ip(value) -> bool:
+ 
+ 
+ def _authorized() -> bool:
+-    return request.headers.get("X-Peer-Secret") == SHARED_SECRET
++    return bool(SHARED_SECRET) and request.headers.get("X-Peer-Secret") == SHARED_SECRET
++
++
++# ---------------------------------------------------------------------------
++# Per-device DNS policy (Tracker Blocker / Malware Shield modules)
++#
++# Every client's WireGuard config points DNS at the relay itself (10.8.0.1),
++# whose resolver applies the ad/tracker/malware blocklist. That stays the
++# default ("filtered") for every tunnel IP. When a user turns modules off in
++# the app, their tunnel IPs get a NAT rule that sends their DNS somewhere
++# else instead — the client config never changes, so there's nothing to
++# re-download:
++#
++#   filtered  Tracker Blocker on   -> relay resolver (blocklist), no rule
++#   malware   only Malware Shield  -> Quad9 9.9.9.9 (blocks malware/phishing
++#                                     domains, not ads)
++#   open      both off             -> Cloudflare 1.1.1.1, no filtering
++#
++# Policies persist in POLICY_FILE and the whole iptables chain is rebuilt
++# from it on every change and at boot (kinetic-dns-policy.service), so the
++# live rules can never drift from the file.
++# ---------------------------------------------------------------------------
++POLICY_FILE = "/etc/kinetic/dns-policy.json"
++POLICY_LOCK = "/etc/kinetic/dns-policy.lock"
++DNS_CHAIN = "KINETIC_DNS"
++RELAY_DNS_IP = "10.8.0.1"
++POLICY_TARGETS = {"malware": "9.9.9.9", "open": "1.1.1.1"}
++VALID_MODES = {"filtered", *POLICY_TARGETS}
++
++
++def _iptables(*args, check=True):
++    return subprocess.run(["iptables", "-t", "nat", *args], capture_output=True, text=True, check=check)
++
++
++def _load_policies() -> dict:
++    try:
++        with open(POLICY_FILE) as f:
++            data = json.load(f)
++        return {ip: mode for ip, mode in data.items() if _valid_allowed_ip(ip) and mode in POLICY_TARGETS}
++    except (FileNotFoundError, ValueError):
++        return {}
++
++
++def _apply_policies(policies: dict) -> None:
++    """Rebuilds the KINETIC_DNS nat chain to exactly match `policies`."""
++    if _iptables("-n", "-L", DNS_CHAIN, check=False).returncode != 0:
++        _iptables("-N", DNS_CHAIN)
++    for proto in ("udp", "tcp"):
++        hook = ["PREROUTING", "-i", "wg0", "-d", RELAY_DNS_IP, "-p", proto, "--dport", "53", "-j", DNS_CHAIN]
++        if _iptables("-C", *hook, check=False).returncode != 0:
++            _iptables("-I", *hook)
++    _iptables("-F", DNS_CHAIN)
++    for ip, mode in sorted(policies.items()):
++        target = POLICY_TARGETS[mode]
++        for proto in ("udp", "tcp"):
++            _iptables("-A", DNS_CHAIN, "-s", f"{ip}/32", "-p", proto, "-j", "DNAT", "--to-destination", f"{target}:53")
++
++
++def _forget_dns_conntrack(ips) -> None:
++    # Existing DNS conntrack entries keep their old NAT decision until they
++    # expire; dropping them makes a toggle take effect on the next lookup.
++    # Best-effort: `conntrack` may not be installed.
++    for ip in ips:
++        for proto in ("udp", "tcp"):
++            try:
++                subprocess.run(["conntrack", "-D", "-s", ip, "-p", proto, "--dport", "53"],
++                               capture_output=True, check=False)
++            except OSError:
++                return
++
++
++def _update_policies(changes: dict) -> dict:
++    os.makedirs(os.path.dirname(POLICY_FILE), exist_ok=True)
++    # gunicorn runs several workers; serialize read-modify-write-apply.
++    with open(POLICY_LOCK, "w") as lock:
++        fcntl.flock(lock, fcntl.LOCK_EX)
++        policies = _load_policies()
++        for ip, mode in changes.items():
++            if mode == "filtered":
++                policies.pop(ip, None)
++            else:
++                policies[ip] = mode
++        tmp = POLICY_FILE + ".tmp"
++        with open(tmp, "w") as f:
++            json.dump(policies, f, indent=2, sort_keys=True)
++        os.replace(tmp, POLICY_FILE)
++        _apply_policies(policies)
++    _forget_dns_conntrack(changes.keys())
++    return policies
+ 
+ 
+ def _dump_peers() -> dict:
+@@ -170,6 +263,33 @@ def peer_status():
+     return jsonify({"peers": statuses})
+ 
+ 
++@app.route("/dns-policy", methods=["POST"])
++def dns_policy():
++    """Body: {"policies": {"10.8.0.7": "filtered" | "malware" | "open", ...}}"""
++    if not _authorized():
++        return jsonify({"error": "unauthorized"}), 401
++    data = request.get_json(silent=True) or {}
++    changes = data.get("policies")
++    if not isinstance(changes, dict) or not changes:
++        return jsonify({"error": "policies (non-empty object) is required"}), 400
++    for ip, mode in changes.items():
++        if not _valid_allowed_ip(ip) or mode not in VALID_MODES:
++            return jsonify({"error": f"invalid policy {ip!r}: {mode!r}"}), 400
++    try:
++        policies = _update_policies(changes)
++    except (subprocess.CalledProcessError, OSError) as exc:
++        return jsonify({"error": str(exc)}), 500
++    return jsonify({"ok": True, "applied": {ip: policies.get(ip, "filtered") for ip in changes}})
++
++
++if __name__ == "__main__" and "--apply-dns-policy" in sys.argv:
++    # Boot path (kinetic-dns-policy.service): restore rules from the file.
++    os.makedirs(os.path.dirname(POLICY_LOCK), exist_ok=True)
++    with open(POLICY_LOCK, "w") as boot_lock:
++        fcntl.flock(boot_lock, fcntl.LOCK_EX)
++        _apply_policies(_load_policies())
++    sys.exit(0)
++
+ if __name__ == "__main__":
+     # Local/manual testing only — production runs this under gunicorn
+     # (see infra/harden-relay-service.sh), which never executes this block.
+diff --git a/package-lock.json b/package-lock.json
+index eac58c6..8cd934a 100644
+--- a/package-lock.json
++++ b/package-lock.json
+@@ -7246,6 +7246,18 @@
+         }
+       }
+     },
++    "node_modules/nitro/node_modules/lru-cache": {
++      "version": "11.5.3",
++      "resolved": "https://registry.npmjs.org/lru-cache/-/lru-cache-11.5.3.tgz",
++      "integrity": "sha512-U4N8FgzmWxc8k1VH8Kr6lQg18U7Fjvby6wXHVRX/ZZ7IwWbRMgrRbP0Wrb5q5NVinryp4SQampHKdvtecItxUg==",
++      "dev": true,
++      "license": "BlueOak-1.0.0",
++      "optional": true,
++      "peer": true,
++      "engines": {
++        "node": "20 || >=22"
++      }
++    },
+     "node_modules/nitro/node_modules/ocache": {
+       "version": "0.1.5",
+       "resolved": "https://registry.npmjs.org/ocache/-/ocache-0.1.5.tgz",
+diff --git a/src/lib/kinetic-data.ts b/src/lib/kinetic-data.ts
+index f87407e..d4cca6d 100644
+--- a/src/lib/kinetic-data.ts
++++ b/src/lib/kinetic-data.ts
+@@ -49,7 +49,7 @@ export const MODULES: Module[] = [
+     id: "malware",
+     name: "Malware Shield",
+     category: "Threats",
+-    description: "Behavioral analysis blocks zero-day payloads at the gateway.",
++    description: "Blocks known malware and phishing domains for every device on your tunnel.",
+     loadMb: 68,
+     latencyMs: 3,
+     defaultOn: true,
+@@ -67,7 +67,8 @@ export const MODULES: Module[] = [
+     id: "tracker",
+     name: "Tracker Blocker",
+     category: "Privacy",
+-    description: "Strips 3rd-party trackers, fingerprinters, and ad beacons.",
++    description:
++      "Blocks ad, tracker, and telemetry domains at the relay for every device on your tunnel.",
+     loadMb: 14,
+     latencyMs: 0,
+     defaultOn: true,
+diff --git a/src/routes/console.test.tsx b/src/routes/console.test.tsx
+index e060753..532d90b 100644
+--- a/src/routes/console.test.tsx
++++ b/src/routes/console.test.tsx
+@@ -206,6 +206,54 @@ describe("Console", () => {
+     expect((alertInsert!.args[0] as { module_id: string }).module_id).toBe("firewall");
+   });
+ 
++  it("pushes Tracker Blocker changes to the relay via wg-peers sync-dns", async () => {
++    const user = userEvent.setup();
++    render(<ConsoleRoute />);
++
++    const toggle = await screen.findByRole("switch", { name: /toggle tracker blocker/i });
++    await waitFor(() => expect(toggle).toHaveAttribute("aria-checked", "true"));
++
++    await user.click(toggle);
++
++    await waitFor(() =>
++      expect(invoke).toHaveBeenCalledWith("wg-peers", { body: { action: "sync-dns" } }),
++    );
++    // The sync must follow the saved setting, not race ahead of it.
++    const persistIdx = calls.findIndex(
++      (c) =>
++        c.table === "module_settings" &&
++        c.op === "upsert" &&
++        (c.args[0] as { module_id: string }).module_id === "tracker",
++    );
++    expect(persistIdx).toBeGreaterThanOrEqual(0);
++  });
++
++  it("does not call the relay for modules that are still simulated", async () => {
++    const user = userEvent.setup();
++    render(<ConsoleRoute />);
++
++    const toggle = await screen.findByRole("switch", { name: /toggle adaptive firewall/i });
++    await waitFor(() => expect(toggle).toHaveAttribute("aria-checked", "false"));
++    await user.click(toggle);
++    await waitFor(() => expect(toggle).toHaveAttribute("aria-checked", "true"));
++
++    expect(invoke).not.toHaveBeenCalledWith("wg-peers", { body: { action: "sync-dns" } });
++  });
++
++  it("skips the relay sync if saving the setting failed", async () => {
++    responses["module_settings:upsert"] = { data: null, error: { message: "boom" } };
++    const user = userEvent.setup();
++    render(<ConsoleRoute />);
++
++    const toggle = await screen.findByRole("switch", { name: /toggle malware shield/i });
++    await waitFor(() => expect(toggle).toHaveAttribute("aria-checked", "true"));
++    await user.click(toggle);
++    await waitFor(() => expect(toggle).toHaveAttribute("aria-checked", "false"));
++    await new Promise((r) => setTimeout(r, 50));
++
++    expect(invoke).not.toHaveBeenCalledWith("wg-peers", { body: { action: "sync-dns" } });
++  });
++
+   it("clears alert history via a real delete, not just local state", async () => {
+     responses["alerts:select"] = {
+       data: [
+diff --git a/src/routes/console.tsx b/src/routes/console.tsx
+index c5eab2a..f452f5d 100644
+--- a/src/routes/console.tsx
++++ b/src/routes/console.tsx
+@@ -45,6 +45,8 @@ const TOGGLE_MODULES = MODULES.filter((m) => m.id !== "tunnel") as Array<
+   Module & { id: ToggleModuleId }
+ >;
+ const TUNNEL_MODULE = MODULES.find((m) => m.id === "tunnel")!;
++// Modules whose on/off state is enforced by the relay (per-device DNS policy).
++const DNS_ENFORCED_MODULES = new Set<ModuleId>(["tracker", "malware"]);
+ 
+ type TunnelPeer = {
+   public_key: string;
+@@ -236,12 +238,13 @@ function Console() {
+   );
+   const unread = alerts.filter((a) => !a.read).length;
+ 
+-  const persistModuleSetting = (id: ToggleModuleId, on: boolean) => {
++  // Resolves true once the setting is saved, so callers can chain the relay
++  // sync below only after the DB reflects the new value.
++  const persistModuleSetting = (id: ToggleModuleId, on: boolean): Promise<boolean> => {
+     const uid = userIdRef.current;
+-    if (!uid) return;
+-    supabase
+-      .from("module_settings")
+-      .upsert(
++    if (!uid) return Promise.resolve(false);
++    return Promise.resolve(
++      supabase.from("module_settings").upsert(
+         {
+           user_id: uid,
+           module_id: id,
+@@ -249,10 +252,26 @@ function Console() {
+           updated_at: new Date().toISOString(),
+         },
+         { onConflict: "user_id,module_id" },
+-      )
+-      .then(({ error }) => {
+-        if (error) console.error(error);
++      ),
++    ).then(({ error }) => {
++      if (error) console.error(error);
++      return !error;
++    });
++  };
++
++  // Tracker Blocker and Malware Shield are enforced for real by the relay's
++  // DNS: after either changes, ask wg-peers to push this user's saved
++  // settings to the relay for every registered device (see "sync-dns").
++  const syncDnsPolicy = async () => {
++    const { error } = await supabase.functions.invoke("wg-peers", {
++      body: { action: "sync-dns" },
++    });
++    if (error) {
++      console.error(error);
++      toast.error("Couldn't apply filtering to your devices", {
++        description: "Your choice is saved — it will apply the next time you change it.",
+       });
++    }
+   };
+ 
+   const toggle = (id: ToggleModuleId) => {
+@@ -260,7 +279,9 @@ function Console() {
+       const next = { ...prev, [id]: !prev[id] };
+       const mod = TOGGLE_MODULES.find((m) => m.id === id)!;
+       const nowOn = next[id];
+-      persistModuleSetting(id, nowOn);
++      void persistModuleSetting(id, nowOn).then((saved) => {
++        if (saved && DNS_ENFORCED_MODULES.has(id)) void syncDnsPolicy();
++      });
+       if (nowOn) {
+         pushAlert({
+           level: "success",
+@@ -287,7 +308,9 @@ function Console() {
+         {} as Record<ToggleModuleId, boolean>,
+       ),
+     );
+-    TOGGLE_MODULES.forEach((m) => persistModuleSetting(m.id, on));
++    void Promise.all(TOGGLE_MODULES.map((m) => persistModuleSetting(m.id, on))).then((saved) => {
++      if (saved.some(Boolean)) void syncDnsPolicy();
++    });
+     pushAlert({
+       level: on ? "success" : "warn",
+       title: on ? "All modules engaged" : "All modules disabled",
+diff --git a/src/routes/spec.tsx b/src/routes/spec.tsx
+index 98244bc..d4924ff 100644
+--- a/src/routes/spec.tsx
++++ b/src/routes/spec.tsx
+@@ -75,17 +75,33 @@ function Spec() {
+           </p>
+         </section>
+ 
++        <section className="mt-8">
++          <h2 className="text-lg font-semibold">Tracker Blocker &amp; Malware Shield</h2>
++          <p className="mt-2 text-sm text-muted-foreground">
++            These two toggles are real and apply to every device you've registered. Your devices use
++            the relay itself (<code className="text-mono">10.8.0.1</code>) for DNS, and the relay
++            decides per device where those lookups go: with Tracker Blocker on, to the relay's own
++            resolver, which refuses known ad, tracker, and malware domains (blocked lookups show up
++            in your alerts); with only Malware Shield on, to Quad9, which refuses known malware and
++            phishing domains but not ads; with both off, to an ordinary unfiltered resolver.
++            Flipping a toggle saves your choice, then the{" "}
++            <code className="text-mono">wg-peers</code> "sync-dns" action pushes it to the relay,
++            which rewrites a firewall rule for your tunnel addresses — no new config file needed,
++            and it takes effect on the next lookup. This is DNS-level blocking: it stops a device
++            from finding ad and malware servers, but it can't remove ads served from the same domain
++            as the content (for example, video ads inside the YouTube app).
++          </p>
++        </section>
++
+         <section className="mt-8">
+           <h2 className="text-lg font-semibold">What's simulated (for now)</h2>
+           <p className="mt-2 text-sm text-muted-foreground">
+-            Everything else inside the console — the other module toggles (malware shield, tracker
+-            blocker, adaptive firewall, etc.), the live threat-event feed, and the region picker —
+-            is still simulated. Toggling one of those modules updates real, persisted state and
+-            generates realistic sample events, but none of it inspects or routes real traffic yet,
+-            and it's entirely separate from the one real relay described above. There is currently
+-            one relay node, not the four regions listed below — those remain illustrative until more
+-            relays are provisioned and the module logic is actually wired to run against real
+-            traffic through them.
++            The remaining module toggles (adaptive firewall, private DNS, identity masking, kill
++            switch, split tunneling), the sample threat events they generate, and the region picker
++            are still simulated. Toggling one of those modules updates real, persisted state, but
++            none of it inspects or routes real traffic yet. There is currently one relay node, not
++            the four regions listed below — those remain illustrative until more relays are
++            provisioned.
+           </p>
+         </section>
+ 
+diff --git a/supabase/functions/wg-peers/index.ts b/supabase/functions/wg-peers/index.ts
+index 5e020cb..c2b4fb0 100644
+--- a/supabase/functions/wg-peers/index.ts
++++ b/supabase/functions/wg-peers/index.ts
+@@ -1,4 +1,5 @@
+-// Supabase Edge Function: register or revoke a WireGuard peer.
++// Supabase Edge Function: register or revoke a WireGuard peer, report live
++// tunnel status, and sync per-device DNS filtering policy to the relay.
+ //
+ // Why this exists as a server-side function rather than a direct client
+ // insert into `wg_peers`: IP assignment has to be single-writer (two users
+@@ -10,7 +11,7 @@
+ // Deploy with:
+ //   supabase functions deploy wg-peers
+ // Required secrets (supabase secrets set):
+-//   RELAY_URL          e.g. http://104.154.119.10:8787
++//   RELAY_URL          e.g. https://104.154.119.10.sslip.io
+ //   RELAY_SHARED_SECRET  the secret printed by relay-setup.sh
+ //   RELAY_SERVER_PUBLIC_KEY  the relay's WireGuard public key
+ //   RELAY_ENDPOINT      e.g. 104.154.119.10:51820
+@@ -18,11 +19,39 @@
+ // SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY are provided automatically to
+ // every Edge Function by the Supabase runtime — no need to set them.
+ 
+-import { createClient } from "jsr:@supabase/supabase-js@2";
++import { createClient, type SupabaseClient } from "jsr:@supabase/supabase-js@2";
+ 
+ const TUNNEL_SUBNET_PREFIX = "10.8.0.";
+ const FIRST_CLIENT_OCTET = 2; // .1 is the relay itself
+ const LAST_CLIENT_OCTET = 254;
++// How many times to retry IP allocation if two registrations race for the
++// same address (see the retry loop in the "register" handler below).
++const MAX_ALLOCATION_ATTEMPTS = 5;
++
++// Module defaults when a user has no module_settings row yet. Must match
++// `defaultOn` for these modules in src/lib/kinetic-data.ts.
++const DNS_MODULE_DEFAULTS = { tracker: true, malware: true } as const;
++
++type DnsMode = "filtered" | "malware" | "open";
++
++// Tracker Blocker on  -> relay's own resolver (ad/tracker/malware blocklist)
++// only Malware Shield -> Quad9 (blocks malware/phishing domains, not ads)
++// both off            -> unfiltered resolver
++// See the "Per-device DNS policy" section of infra/relay_peer_service.py.
++export function dnsModeFor(settings: { tracker: boolean; malware: boolean }): DnsMode {
++  if (settings.tracker) return "filtered";
++  if (settings.malware) return "malware";
++  return "open";
++}
++
++// A WireGuard key is a 32-byte value, base64-encoded — always 44 characters,
++// the last one padding ("="). Rejecting anything else here means garbage
++// input never reaches the relay's `wg` invocation at all, and can't be
++// abused as an argument-injection vector (e.g. a value starting with "-"
++// being parsed as a flag rather than a positional argument).
++function isValidWgPublicKey(value: unknown): value is string {
++  return typeof value === "string" && /^[A-Za-z0-9+/]{43}=$/.test(value);
++}
+ 
+ // Browsers call this function directly (via supabase.functions.invoke), so
+ // it needs its own CORS headers — Supabase does not add these for you.
+@@ -41,6 +70,39 @@ function jsonResponse(body: unknown, init: ResponseInit = {}) {
+   });
+ }
+ 
++async function userDnsMode(admin: SupabaseClient, userId: string): Promise<DnsMode> {
++  const { data, error } = await admin
++    .from("module_settings")
++    .select("module_id, enabled")
++    .eq("user_id", userId)
++    .in("module_id", ["tracker", "malware"]);
++  if (error) throw new Error(error.message);
++  const settings: { tracker: boolean; malware: boolean } = { ...DNS_MODULE_DEFAULTS };
++  for (const row of data ?? []) {
++    if (row.module_id === "tracker" || row.module_id === "malware") {
++      settings[row.module_id as "tracker" | "malware"] = row.enabled;
++    }
++  }
++  return dnsModeFor(settings);
++}
++
++async function pushDnsPolicy(
++  relayUrl: string,
++  relaySecret: string,
++  policies: Record<string, DnsMode>,
++): Promise<boolean> {
++  if (Object.keys(policies).length === 0) return true;
++  const resp = await fetch(`${relayUrl}/dns-policy`, {
++    method: "POST",
++    headers: { "Content-Type": "application/json", "X-Peer-Secret": relaySecret },
++    body: JSON.stringify({ policies }),
++  }).catch((err) => {
++    console.error("relay dns-policy request failed", err);
++    return null;
++  });
++  return !!resp && resp.ok;
++}
++
+ Deno.serve(async (req: Request) => {
+   // Preflight request — browsers send this before the real POST.
+   if (req.method === "OPTIONS") {
+@@ -90,88 +152,140 @@ Deno.serve(async (req: Request) => {
+   }
+ 
+   if (action === "register") {
+-    const publicKey = body?.public_key as string | undefined;
++    const publicKey = body?.public_key;
+     const label = (body?.label as string | undefined) ?? null;
+-    if (!publicKey) {
+-      return jsonResponse({ error: "public_key is required" }, { status: 400 });
+-    }
+-
+-    // Pick the next free address in the tunnel subnet.
+-    const { data: existing, error: listError } = await admin
+-      .from("wg_peers")
+-      .select("allowed_ip")
+-      .is("revoked_at", null);
+-    if (listError) {
+-      return jsonResponse({ error: listError.message }, { status: 500 });
+-    }
+-    const used = new Set(
+-      (existing ?? []).map((row: { allowed_ip: string }) => Number(row.allowed_ip.split(".")[3])),
+-    );
+-    let octet = FIRST_CLIENT_OCTET;
+-    while (used.has(octet) && octet <= LAST_CLIENT_OCTET) octet++;
+-    if (octet > LAST_CLIENT_OCTET) {
++    if (!isValidWgPublicKey(publicKey)) {
+       return jsonResponse(
+-        { error: "Relay tunnel subnet is full" },
+-        {
+-          status: 503,
+-        },
++        { error: "public_key must be a 44-character base64 WireGuard key" },
++        { status: 400 },
+       );
+     }
+-    const allowedIp = `${TUNNEL_SUBNET_PREFIX}${octet}`;
+ 
+-    // Activate the peer on the actual relay before we commit the row.
+-    const relayResp = await fetch(`${relayUrl}/add-peer`, {
+-      method: "POST",
+-      headers: { "Content-Type": "application/json", "X-Peer-Secret": relaySecret },
+-      body: JSON.stringify({ public_key: publicKey, allowed_ip: allowedIp }),
+-    });
+-    if (!relayResp.ok) {
+-      return jsonResponse(
+-        { error: "Relay rejected the new peer" },
+-        {
+-          status: 502,
+-        },
++    // Removes the relay-side peer we just added when a registration can't
++    // be committed after all — otherwise the relay would keep routing to a
++    // peer that has no corresponding (or no longer current) Supabase row.
++    const cleanupRelayPeer = () =>
++      fetch(`${relayUrl}/remove-peer`, {
++        method: "POST",
++        headers: { "Content-Type": "application/json", "X-Peer-Secret": relaySecret },
++        body: JSON.stringify({ public_key: publicKey }),
++      }).catch(() => null);
++
++    // Pick the next free address in the tunnel subnet, retrying if a
++    // concurrent registration wins the same address first. `allowed_ip` has
++    // a DB-level unique constraint (see 0002_wg_peers.sql), so a collision
++    // surfaces here as a 23505 insert error rather than silently handing
++    // two peers the same IP — this loop is what turns that into a retry
++    // instead of a failed registration with an orphaned relay peer. `wg set`
++    // is an upsert keyed by public key, so re-adding the same key with a
++    // different address on retry just re-points the one peer, it doesn't
++    // create a duplicate.
++    for (let attempt = 0; attempt < MAX_ALLOCATION_ATTEMPTS; attempt++) {
++      const { data: existing, error: listError } = await admin
++        .from("wg_peers")
++        .select("allowed_ip")
++        .is("revoked_at", null);
++      if (listError) {
++        return jsonResponse({ error: listError.message }, { status: 500 });
++      }
++      const used = new Set(
++        (existing ?? []).map((row: { allowed_ip: string }) => Number(row.allowed_ip.split(".")[3])),
+       );
+-    }
++      let octet = FIRST_CLIENT_OCTET;
++      while (used.has(octet) && octet <= LAST_CLIENT_OCTET) octet++;
++      if (octet > LAST_CLIENT_OCTET) {
++        return jsonResponse({ error: "Relay tunnel subnet is full" }, { status: 503 });
++      }
++      const allowedIp = `${TUNNEL_SUBNET_PREFIX}${octet}`;
+ 
+-    const { error: insertError } = await admin.from("wg_peers").insert({
+-      user_id: user.id,
+-      public_key: publicKey,
+-      allowed_ip: allowedIp,
+-      label,
+-    });
+-    if (insertError) {
+-      return jsonResponse({ error: insertError.message }, { status: 500 });
++      // Activate the peer on the actual relay before we commit the row.
++      const relayResp = await fetch(`${relayUrl}/add-peer`, {
++        method: "POST",
++        headers: { "Content-Type": "application/json", "X-Peer-Secret": relaySecret },
++        body: JSON.stringify({ public_key: publicKey, allowed_ip: allowedIp }),
++      });
++      if (!relayResp.ok) {
++        return jsonResponse({ error: "Relay rejected the new peer" }, { status: 502 });
++      }
++
++      const { error: insertError } = await admin.from("wg_peers").insert({
++        user_id: user.id,
++        public_key: publicKey,
++        allowed_ip: allowedIp,
++        label,
++      });
++      if (!insertError) {
++        // Apply this user's Tracker/Malware choices to the new device. Always
++        // sent (even "filtered") so an IP reused from a revoked peer can't
++        // inherit the previous owner's policy. Best-effort: the device works
++        // either way and the next toggle re-syncs it.
++        let dnsSynced = false;
++        try {
++          const mode = await userDnsMode(admin, user.id);
++          dnsSynced = await pushDnsPolicy(relayUrl, relaySecret, { [allowedIp]: mode });
++        } catch (err) {
++          console.error("dns policy sync on register failed", err);
++        }
++        return jsonResponse({
++          allowed_ip: allowedIp,
++          server_public_key: Deno.env.get("RELAY_SERVER_PUBLIC_KEY"),
++          endpoint: Deno.env.get("RELAY_ENDPOINT"),
++          dns_policy_synced: dnsSynced,
++        });
++      }
++
++      const isIpCollision =
++        insertError.code === "23505" && /allowed_ip/i.test(insertError.message ?? "");
++      if (!isIpCollision) {
++        // Not recoverable by retrying (e.g. this exact key is already
++        // registered) — don't leave the relay peer we just added behind.
++        await cleanupRelayPeer();
++        return jsonResponse({ error: insertError.message }, { status: 500 });
++      }
++      // Otherwise a concurrent request took this address first — loop and
++      // pick the next free one.
+     }
+ 
+-    return jsonResponse({
+-      allowed_ip: allowedIp,
+-      server_public_key: Deno.env.get("RELAY_SERVER_PUBLIC_KEY"),
+-      endpoint: Deno.env.get("RELAY_ENDPOINT"),
+-    });
++    await cleanupRelayPeer();
++    return jsonResponse(
++      { error: "Too many concurrent registrations — please try again" },
++      { status: 503 },
++    );
+   }
+ 
+   if (action === "revoke") {
+-    const publicKey = body?.public_key as string | undefined;
+-    if (!publicKey) {
+-      return jsonResponse({ error: "public_key is required" }, { status: 400 });
++    const publicKey = body?.public_key;
++    if (!isValidWgPublicKey(publicKey)) {
++      return jsonResponse(
++        { error: "public_key must be a 44-character base64 WireGuard key" },
++        { status: 400 },
++      );
+     }
+ 
+     // Only allow revoking a peer that actually belongs to the caller.
+     const { data: peer, error: peerError } = await admin
+       .from("wg_peers")
+-      .select("id, user_id")
++      .select("id, user_id, allowed_ip")
+       .eq("public_key", publicKey)
+       .maybeSingle();
+     if (peerError || !peer || peer.user_id !== user.id) {
+       return jsonResponse({ error: "Peer not found" }, { status: 404 });
+     }
+ 
+-    await fetch(`${relayUrl}/remove-peer`, {
++    // Revoking in our own DB is what actually stops the app from trusting
++    // this peer, so that always proceeds. But if the relay call fails, the
++    // key would still be live on wg0 and able to pass traffic — that's
++    // reported back rather than swallowed, instead of silently pretending
++    // the device is fully cut off.
++    const relayResp = await fetch(`${relayUrl}/remove-peer`, {
+       method: "POST",
+       headers: { "Content-Type": "application/json", "X-Peer-Secret": relaySecret },
+       body: JSON.stringify({ public_key: publicKey }),
+-    }).catch(() => null); // best-effort; still mark revoked below
++    }).catch((err) => {
++      console.error("relay remove-peer request failed", err);
++      return null;
++    });
++    const relayCleanupFailed = !relayResp || !relayResp.ok;
+ 
+     const { error: updateError } = await admin
+       .from("wg_peers")
+@@ -181,7 +295,80 @@ Deno.serve(async (req: Request) => {
+       return jsonResponse({ error: updateError.message }, { status: 500 });
+     }
+ 
+-    return jsonResponse({ ok: true }, { status: 200 });
++    // Return the freed IP to the default (filtered) policy. Register also
++    // re-sends the policy for a reused IP, so this is just tidiness.
++    await pushDnsPolicy(relayUrl, relaySecret, { [peer.allowed_ip]: "filtered" });
++
++    return jsonResponse({ ok: true, relay_cleanup_failed: relayCleanupFailed }, { status: 200 });
++  }
++
++  if (action === "sync-dns") {
++    // Called by the console after the user flips Tracker Blocker or Malware
++    // Shield. Reads the saved settings (not the request body), so the relay
++    // only ever reflects what's actually persisted for this user.
++    const { data: peers, error: peersError } = await admin
++      .from("wg_peers")
++      .select("allowed_ip")
++      .eq("user_id", user.id)
++      .is("revoked_at", null);
++    if (peersError) {
++      return jsonResponse({ error: peersError.message }, { status: 500 });
++    }
++    let mode: DnsMode;
++    try {
++      mode = await userDnsMode(admin, user.id);
++    } catch (err) {
++      return jsonResponse({ error: (err as Error).message }, { status: 500 });
++    }
++    const policies = Object.fromEntries((peers ?? []).map((p) => [p.allowed_ip, mode]));
++    const ok = await pushDnsPolicy(relayUrl, relaySecret, policies);
++    if (!ok) {
++      return jsonResponse({ error: "Relay did not accept the DNS policy" }, { status: 502 });
++    }
++    return jsonResponse({ ok: true, mode, devices: Object.keys(policies).length });
++  }
++
++  if (action === "status") {
++    const { data: peers, error: peersError } = await admin
++      .from("wg_peers")
++      .select("public_key, allowed_ip, label")
++      .eq("user_id", user.id)
++      .is("revoked_at", null);
++    if (peersError) {
++      return jsonResponse({ error: peersError.message }, { status: 500 });
++    }
++    if (!peers || peers.length === 0) {
++      return jsonResponse({ peers: [] });
++    }
++
++    const relayResp = await fetch(`${relayUrl}/peer-status`, {
++      method: "POST",
++      headers: { "Content-Type": "application/json", "X-Peer-Secret": relaySecret },
++      body: JSON.stringify({ public_keys: peers.map((p) => p.public_key) }),
++    });
++    if (!relayResp.ok) {
++      return jsonResponse({ error: "Relay did not return peer status" }, { status: 502 });
++    }
++    const relayData = (await relayResp.json()) as {
++      peers: Record<
++        string,
++        { registered: boolean; connected?: boolean; latest_handshake?: number | null }
++      >;
++    };
++
++    return jsonResponse({
++      peers: peers.map((p) => {
++        const status = relayData.peers[p.public_key] ?? { registered: false };
++        return {
++          public_key: p.public_key,
++          allowed_ip: p.allowed_ip,
++          label: p.label,
++          registered: status.registered,
++          connected: status.connected ?? false,
++          latest_handshake: status.latest_handshake ?? null,
++        };
++      }),
++    });
+   }
+ 
+   return jsonResponse({ error: "Unknown action" }, { status: 400 });
